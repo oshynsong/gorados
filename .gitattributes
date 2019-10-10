@@ -1,0 +1,4 @@
+*.h linguist-language=golang
+*.c linguist-language=golang
+*.cc linguist-language=golang
+*.s linguist-language=golang
