@@ -183,7 +183,6 @@ func (s *SockAddr6) UnmarshalBinary(data []byte) error {
 	if err := binary.Read(b, binary.BigEndian, s); err != nil {
 		return err
 	}
-	s.Family = (s.Family >> 8) + ((s.Family & 0xff) << 8)
 	return nil
 }
 

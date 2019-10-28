@@ -159,7 +159,7 @@ func (c *radosConn) Dial(network, addr string) error {
 }
 
 // Connect implements the private handshake protocol to RADOS cluster.
-func (c *radosConn) Connect(keyring string, prepare bool) (err error) {
+func (c *radosConn) Connect(keyring string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic error: %v", r)
@@ -333,7 +333,7 @@ func (c *radosConn) Connect(keyring string, prepare bool) (err error) {
 	go c.writer()
 	log.Print("start reader to process data from remote side")
 	go c.reader()
-	return c.authenticate(prepare)
+	return c.authenticate()
 }
 
 // MonCommand send the command to the RADOS monitor.
@@ -377,7 +377,7 @@ func (c *radosConn) MonCommand(cmd []byte) (result []byte, err error) {
 }
 
 // authenticate perform the private authority facility with the given keyring.
-func (c *radosConn) authenticate(prepare bool) error {
+func (c *radosConn) authenticate() error {
 	var (
 		ver       uint16 = 1
 		transId   uint64
@@ -455,9 +455,6 @@ func (c *radosConn) authenticate(prepare bool) error {
 				tpl += "validity=%d encrypted=%v secretId=%d\n  sessionKey=%+v"
 				log.Printf(tpl, c.sessionTicket.ServiceId, c.sessionTicket.Validity,
 					c.sessionTicket.Encrypted, c.sessionTicket.SecretId, c.sessionTicket.SessionKey)
-				if prepare {
-					return nil
-				}
 
 				// Try to send PrincipalKey auth message
 				log.Printf("sending get-principal-key message ...")
