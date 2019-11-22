@@ -45,12 +45,13 @@ type radosConn struct {
 	conn *net.TCPConn
 
 	ctx        context.Context
+	canceller  context.CancelFunc
 	dialer     *net.Dialer
 	remoteAddr *net.TCPAddr
 	localAddr  *net.TCPAddr
 	state      radosConnStateType
 	lock       *sync.Mutex
-	cond       *sync.Cond
+	statusChan chan struct{}
 	sendChan   chan Message
 	recvChan   chan Message
 	wg         sync.WaitGroup
@@ -97,10 +98,10 @@ type radosConn struct {
 // defined in this package to specify: MON or OSD.
 func NewRadosConn(ctx context.Context, entityToConnect ConnectEntity) *radosConn {
 	conn := &radosConn{
-		ctx:              ctx,
 		dialer:           &net.Dialer{},
 		state:            radosConnStateInvalid,
 		lock:             &sync.Mutex{},
+		statusChan:       make(chan struct{}),
 		sendChan:         make(chan Message, MessageQueueSize),
 		recvChan:         make(chan Message, MessageQueueSize),
 		moncmdLock:       &sync.Mutex{},
@@ -111,13 +112,17 @@ func NewRadosConn(ctx context.Context, entityToConnect ConnectEntity) *radosConn
 		ReadTimeout:      defaultReadTimeout,
 		WriteTimeout:     defaultWriteTimeout,
 	}
-	conn.cond = sync.NewCond(conn.lock)
+	conn.ctx, conn.canceller = context.WithCancel(ctx)
 	return conn
 }
 
 func (c *radosConn) Dial(network, addr string) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+	 if c.state != radosConnStateInvalid && c.state != radosConnStateClosed {
+		log.Printf("already connecting or connected to %s", addr)
+		return nil
+	}
 	remoteAddr, err := net.ResolveTCPAddr(network, addr)
 	if err != nil {
 		return err
@@ -352,7 +357,6 @@ func (c *radosConn) MonCommand(cmd []byte) (result []byte, err error) {
 		log.Printf("send auth message failed: %v", err)
 		return
 	}
-	c.cond.Broadcast()
 
 	// Receive the command return message and check the return code.
 	var msgCmdReply *MessageMonCommand
@@ -443,7 +447,6 @@ func (c *radosConn) authenticate() error {
 					return err
 				}
 				sentGetSessionKey = true
-				c.cond.Broadcast()
 			case sentGetSessionKey && !sentGetPrincipalKey: // get session key reply
 				tickets, err := m.GetSessionTickets(c.cryptoKey)
 				if err != nil || len(tickets) == 0 {
@@ -474,7 +477,6 @@ func (c *radosConn) authenticate() error {
 					return err
 				}
 				sentGetPrincipalKey = true
-				c.cond.Broadcast()
 			case sentGetSessionKey && sentGetPrincipalKey: // get principal key reply
 				tickets, err := m.GetSessionTickets(&c.sessionTicket.SessionKey)
 				if err != nil {
@@ -526,7 +528,6 @@ func (c *radosConn) Subscribe(name string) error {
 		log.Printf("send %s message failed: %v", msgSub.Name(), err)
 		return err
 	}
-	c.cond.Broadcast()
 
 	// Receive the return message and check the return code.
 	for {
@@ -550,10 +551,10 @@ func (c *radosConn) Subscribe(name string) error {
 func (c *radosConn) reader() {
 	c.lock.Lock()
 	defer func() {
-		c.cond.Broadcast()
 		c.lock.Unlock()
 		log.Printf("reader exit")
 		c.wg.Done()
+		c.canceller() // cancel the writer explicitly.
 	}()
 	tagBuf := make([]byte, 1)
 	for c.state != radosConnStateInvalid && c.state != radosConnStateClosed {
@@ -591,7 +592,7 @@ func (c *radosConn) reader() {
 					break
 				}
 				c.needSendKeepalive = true
-				c.cond.Broadcast()
+				c.statusChan <- struct{}{}
 			case MSG_TAG_MSG:
 				log.Print("reader got MSG tag")
 				c.lock.Lock()
@@ -602,7 +603,7 @@ func (c *radosConn) reader() {
 				}
 				log.Printf("reader read message #%d success", msg.Sequence())
 				c.inSeq = msg.Sequence()
-				c.cond.Broadcast()
+				c.statusChan <- struct{}{}
 				c.recvChan <- msg
 			case MSG_TAG_CLOSE:
 				log.Print("reader got CLOSE tag")
@@ -620,21 +621,19 @@ func (c *radosConn) reader() {
 }
 
 func (c *radosConn) writer() {
-	c.lock.Lock()
 	defer func() {
-		c.lock.Unlock()
 		log.Printf("writer exit")
 		c.wg.Done()
 	}()
 	for c.state != radosConnStateInvalid && c.state != radosConnStateClosed {
+		log.Printf("writer begin processing: state=%d", c.state)
+		if c.state == radosConnStateConnecting {
+			return
+		}
 		select {
 		case <-c.ctx.Done():
 			return
-		default:
-			log.Printf("writer begin processing: state=%d", c.state)
-			if c.state == radosConnStateConnecting {
-				return
-			}
+		case <-c.statusChan:
 			if c.needSendKeepalive {
 				if err := c.sendKeepAlive(); err != nil {
 					log.Printf("writer do keepalive failed: %v", err)
@@ -649,35 +648,29 @@ func (c *radosConn) writer() {
 				c.inAckedSeq = c.inSeq
 			}
 
-			// Try to get a message and do sending.
-			select {
-			case msg := <-c.sendChan:
-				data, err := msg.MarshalBinary()
-				if err != nil {
-					log.Printf("writer marshal message failed: %v", err)
-					continue
-				}
-				data = append(data, byte(MSG_TAG_MSG))
-				copy(data[1:], data)
-				data[0] = byte(MSG_TAG_MSG)
-				if _, err := c.Write(data); err != nil {
-					log.Printf("writer send message failed: %v", err)
-					continue
-				}
-				log.Printf("send message success seq=%d", msg.Sequence())
-			default:
-				log.Printf("writer sleeping: state=%d", c.state)
-				c.cond.Wait()
+		case msg, ok := <-c.sendChan: // try to get a message and do sending.
+			if !ok {
+				break
 			}
+			data, err := msg.MarshalBinary()
+			if err != nil {
+				log.Printf("writer marshal message failed: %v", err)
+				continue
+			}
+			data = append(data, byte(MSG_TAG_MSG))
+			copy(data[1:], data)
+			data[0] = byte(MSG_TAG_MSG)
+			if _, err := c.Write(data); err != nil {
+				log.Printf("writer send message failed: %v", err)
+				continue
+			}
+			log.Printf("send message success seq=%d", msg.Sequence())
 		}
 	}
 }
 
 func (c *radosConn) sendMessage(msg Message) error {
-	c.lock.Lock()
-	c.cond.Broadcast()
-	c.lock.Unlock()
-	ctx, _ := context.WithTimeout(c.ctx, c.WriteTimeout)
+	ctx, _ := context.WithTimeout(c.ctx, time.Second * 10)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -687,10 +680,7 @@ func (c *radosConn) sendMessage(msg Message) error {
 }
 
 func (c *radosConn) recvMessage() (Message, error) {
-	c.lock.Lock()
-	c.cond.Broadcast()
-	c.lock.Unlock()
-	ctx, _ := context.WithTimeout(c.ctx, c.ReadTimeout)
+	ctx, _ := context.WithTimeout(c.ctx, time.Second * 10)
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -841,7 +831,6 @@ func (c *radosConn) SetLocalAddr(network, addr string) error {
 func (c *radosConn) Close() error {
 	c.lock.Lock()
 	c.state = radosConnStateClosed
-	c.cond.Broadcast()
 	err := c.conn.Close()
 	c.lock.Unlock()
 	c.wg.Wait()
