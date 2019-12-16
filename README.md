@@ -68,6 +68,10 @@ func main() {
 }
 ```
 
+## Documentation
+
+Reference locates on the golang.org [here](https://godoc.org/github.com/oshynsong/gorados).
+
 ## Contribution
 
 It needs more development and improvement to make gorados strong and stable. Just fork this [repository](https://github.com/oshynsong/gorados) and make pull request.
